@@ -3,12 +3,11 @@ FROM golang:1.21-alpine AS builder
 
 WORKDIR /build
 
-# Download dependencies and generate go.sum
-COPY go.mod ./
+# Copy source and download dependencies
+COPY . .
 RUN GONOSUMCHECK=* GOFLAGS=-mod=mod go mod tidy
 
 # Build the binary
-COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o feishu-agent .
 
 # ---- runtime stage ----
@@ -18,5 +17,7 @@ RUN apk add --no-cache ca-certificates tzdata
 
 WORKDIR /app
 COPY --from=builder /build/feishu-agent .
+
+EXPOSE 8765
 
 CMD ["/app/feishu-agent"]

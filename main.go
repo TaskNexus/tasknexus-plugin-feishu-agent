@@ -1,20 +1,19 @@
 // Package main implements a Feishu long-connection agent that receives
-// card interaction callbacks via WebSocket and forwards them to the Django backend.
+// card interaction callbacks via WebSocket from Feishu and forwards them
+// to specific WebSocket clients identified by their unique client_id.
 //
 // Callback flow:
-//   1. Feishu sends card.action.trigger via WebSocket
-//   2. This agent forwards the event to Django (HTTP POST)
-//   3. Django forwards callback data to bamboo node
-//   4. This agent returns from handler (SDK ACK is sent to Feishu)
-// Card update is handled by dedicated pipeline nodes, not by this agent.
+//  1. Python client connects to the WS server, receives a unique client_id
+//  2. Python client sends a Feishu card with client_id in action.value
+//  3. Feishu sends card.action.trigger via long-connection WebSocket
+//  4. This agent extracts client_id, forwards the callback to the WS client
+//  5. This agent returns nil (SDK ACK is sent to Feishu)
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"time"
@@ -23,20 +22,11 @@ import (
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
+
+	"github.com/tasknexus/feishu-agent/wsserver"
 )
 
 // cardActionEvent mirrors the actual Feishu card.action.trigger event payload.
-// Actual structure (from wire):
-//
-//	{
-//	  "schema": "2.0",
-//	  "header": { "event_type": "card.action.trigger", ... },
-//	  "event": {
-//	    "operator": { "open_id": "ou_xxx" },
-//	    "action":   { "value": { "token": "...", "decision": "...", "open_id": "..." } },
-//	    "context":  { "open_message_id": "om_xxx" }
-//	  }
-//	}
 type cardActionEvent struct {
 	Event cardEventBody `json:"event"`
 }
@@ -62,19 +52,31 @@ type cardContext struct {
 func main() {
 	appID := mustEnv("APP_ID")
 	appSecret := mustEnv("APP_SECRET")
-	backendURL := getEnv("BACKEND_URL", "http://backend:8000/api/feishu/card-callback/")
+	wsPort := getEnv("WS_PORT", "8765")
 
-	fmt.Printf("[feishu-agent] starting, backend=%s\n", backendURL)
+	// Initialize WebSocket hub for client connections
+	hub := wsserver.NewHub()
 
-	httpClient := &http.Client{Timeout: 10 * time.Second}
+	// Start HTTP server for WebSocket connections
+	go func() {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/ws", hub.HandleWS)
+
+		addr := ":" + wsPort
+		fmt.Printf("[feishu-agent] WebSocket server listening on %s\n", addr)
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			fmt.Fprintf(os.Stderr, "[feishu-agent] WebSocket server error: %v\n", err)
+			os.Exit(1)
+		}
+	}()
 
 	// Register event dispatcher: subscribe to card.action.trigger
 	eventHandler := dispatcher.NewEventDispatcher("", "").
 		OnCustomizedEvent("card.action.trigger", func(ctx context.Context, event *larkevent.EventReq) error {
-			return handleCardAction(ctx, event, backendURL, httpClient)
+			return handleCardAction(ctx, event, hub)
 		})
 
-	// Create the WebSocket long-connection client
+	// Create the Feishu long-connection WebSocket client
 	cli := larkws.NewClient(appID, appSecret,
 		larkws.WithEventHandler(eventHandler),
 		larkws.WithLogLevel(larkcore.LogLevelInfo),
@@ -98,8 +100,9 @@ func main() {
 	}
 }
 
-// handleCardAction parses card.action.trigger and forwards it to Django.
-func handleCardAction(ctx context.Context, event *larkevent.EventReq, backendURL string, client *http.Client) error {
+// handleCardAction parses card.action.trigger and forwards it to the
+// WebSocket client identified by client_id in action.value.
+func handleCardAction(ctx context.Context, event *larkevent.EventReq, hub *wsserver.Hub) error {
 	fmt.Printf("[feishu-agent] card.action.trigger received, body=%s\n", string(event.Body))
 
 	var payload cardActionEvent
@@ -108,9 +111,16 @@ func handleCardAction(ctx context.Context, event *larkevent.EventReq, backendURL
 		return nil
 	}
 
-	// Build the forwarded request body for Django
+	// Extract client_id from action.value
+	clientID, _ := payload.Event.Action.Value["client_id"].(string)
+	if clientID == "" {
+		fmt.Printf("[feishu-agent] no client_id in action.value, skipping WS forward\n")
+		return nil
+	}
+
+	// Build the message to forward to the WebSocket client
 	forward := map[string]interface{}{
-		"type":            "card",
+		"type":            "card_callback",
 		"open_message_id": payload.Event.Context.OpenMessageID,
 		"action": map[string]interface{}{
 			"value":   payload.Event.Action.Value,
@@ -118,30 +128,19 @@ func handleCardAction(ctx context.Context, event *larkevent.EventReq, backendURL
 		},
 	}
 
-	fmt.Printf("[feishu-agent] forwarding: token=%v decision=%v node_id=%v node_version=%v open_id=%v msg_id=%v\n",
-		payload.Event.Action.Value["token"],
+	fmt.Printf("[feishu-agent] forwarding to WS client %s: decision=%v open_id=%v msg_id=%v\n",
+		clientID,
 		payload.Event.Action.Value["decision"],
-		payload.Event.Action.Value["node_id"],
-		payload.Event.Action.Value["node_version"],
 		payload.Event.Operator.OpenID,
 		payload.Event.Context.OpenMessageID,
 	)
 
-	body, err := json.Marshal(forward)
-	if err != nil {
-		fmt.Printf("[feishu-agent] failed to marshal forward payload: %v\n", err)
-		return nil
-	}
-
-	resp, err := client.Post(backendURL, "application/json", bytes.NewReader(body))
-	if err != nil {
-		fmt.Printf("[feishu-agent] failed to forward to backend: %v\n", err)
-		return err
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	fmt.Printf("[feishu-agent] backend responded with status %d body=%s\n", resp.StatusCode, string(respBody))
+	// Forward to WS client asynchronously — return nil first to ACK Feishu
+	go func() {
+		if err := hub.SendToClient(clientID, forward); err != nil {
+			fmt.Printf("[feishu-agent] failed to forward to WS client: %v\n", err)
+		}
+	}()
 
 	return nil
 }
