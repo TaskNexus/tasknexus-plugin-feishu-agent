@@ -57,10 +57,11 @@ func main() {
 	// Initialize WebSocket hub for client connections
 	hub := wsserver.NewHub()
 
-	// Start HTTP server for WebSocket connections
+	// Start HTTP server for WebSocket connections.
+	// The public ingress exposes this service under /feishu/ws.
 	go func() {
 		mux := http.NewServeMux()
-		mux.HandleFunc("/ws", hub.HandleWS)
+		mux.HandleFunc("/feishu/ws", hub.HandleWS)
 
 		addr := ":" + wsPort
 		fmt.Printf("[feishu-agent] WebSocket server listening on %s\n", addr)
